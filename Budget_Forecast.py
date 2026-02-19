@@ -60,7 +60,7 @@ def fetch_merged_costs(conn=None, CSP=None, current_month=None):
     # Check if the connection, CSP, or current_month is not provided
     if not conn or not CSP or not current_month:
         logger.error("Missing required parameters to fetch chargeback costs: conn, CSP, or current_month")
-        return False
+        raise ValueError("Missing required parameters to fetch chargeback costs: conn, CSP, or current_month")
     
     try:
         # Using connection context manager to ensure proper cursor handling
@@ -151,14 +151,14 @@ def fetch_merged_costs(conn=None, CSP=None, current_month=None):
 
     except Exception as e:
         logger.error(f"An error occurred: {str(e)}")
-        return pd.DataFrame()
+        raise ValueError(f"An error occurred: {str(e)}")
     
  
 def fetch_bu_names(conn=None):
     # Check if the connection, CSP, or current_month is not provided
     if not conn:
         logger.error("Missing required parameters to fetch bu names: conn")
-        return False
+        raise ValueError("Missing required parameters to fetch bu names: conn")
     
     try:
         # Using connection context manager to ensure proper cursor handling
@@ -191,9 +191,50 @@ def fetch_bu_names(conn=None):
 
     except Exception as e:
         logger.error(f"An error occurred: {str(e)}")
-        return f"An error occurred: {str(e)}"
+        raise ValueError(f"An error occurred: {str(e)}")
     
-       
+
+def fit_and_forecast(df, forecast_period=12, is_log=False):
+    """
+    Fits a Holt-Winters model and returns a forecast Series.
+    is_log=True means forecast uses LOG_SPENT column and converts back via expm1.
+    """
+    
+    series_name = 'LOG_SPENT' if is_log else 'MONTHLY_SPENT'
+    
+    model = ExponentialSmoothing(
+        df[series_name],
+        trend='add',
+        seasonal=None,
+        damped_trend=True
+    )
+
+    fitted = model.fit(
+        smoothing_level=0.6,
+        smoothing_trend=0.5,
+        damping_trend=0.8,
+        optimized=False
+    )
+    
+    # Build forecast index
+    last_month = df.index.max()
+    forecast_index = pd.date_range(
+        start=last_month + pd.offsets.MonthBegin(1),
+        periods=forecast_period,
+        freq='MS'
+    )
+
+    forecast = fitted.forecast(forecast_period)
+    forecast.index = forecast_index
+
+    # Convert back to original scale if log model was used
+    if is_log:
+        forecast = np.expm1(forecast)
+
+    return forecast
+
+
+  
 def main():
     customer = 'dev1-wex'
     customer = customer.lower()
