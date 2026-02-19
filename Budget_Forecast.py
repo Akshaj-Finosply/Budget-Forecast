@@ -12,6 +12,7 @@ import sys
 bar = "="*100
 
 project_root = Path().resolve()
+print(project_root)
 sys.path.append(str(project_root))
 
 from env_map import customer_env_map
@@ -135,7 +136,9 @@ def fetch_merged_costs(conn=None, CSP=None, current_month=None):
             # Fetch data into a pandas DataFrame
             logger.info("Fetching results into a pandas DataFrame.")
             bu = cs.fetch_pandas_all()
-
+            if bu.empty:
+                logger.error("No data returned from Snowflake query")
+                return pd.DataFrame()  
             # Convert the 'MONTH' column to datetime and 'MONTHLY_SPENT' to numeric
             bu['MONTH'] = pd.to_datetime(bu['MONTH'].astype(str), format='%Y%m')
             bu['MONTHLY_SPENT'] = pd.to_numeric(bu['MONTHLY_SPENT'], errors='coerce')
@@ -148,7 +151,7 @@ def fetch_merged_costs(conn=None, CSP=None, current_month=None):
 
     except Exception as e:
         logger.error(f"An error occurred: {str(e)}")
-        return f"An error occurred: {str(e)}"
+        return pd.DataFrame()
     
  
 def fetch_bu_names(conn=None):
@@ -181,6 +184,9 @@ def fetch_bu_names(conn=None):
             # Fetch data into a pandas DataFrame
             logger.info("Fetching results into a pandas DataFrame.")
             bu = cs.fetch_pandas_all()
+            if bu.empty:
+                logger.error("No data returned from Snowflake query")
+                return pd.DataFrame()  
             return bu
 
     except Exception as e:
@@ -208,16 +214,21 @@ def main():
     logger.info(f"Current month: {current_month}")
     
     bu_cost_df = fetch_merged_costs(conn, CSP, current_month)
-    if bu_cost_df is False:
-        raise ValueError("Failed to fetch merged costs")
+    if bu_cost_df.empty:
+        logger.error("No data returned from Snowflake query")
+        raise ValueError("No data returned from Snowflake query")
+
+    
         
     logger.info(f"Number of rows in bu_cost_df: {len(bu_cost_df)}")
     logger.info(bu_cost_df)
     month_counts = (
                         bu_cost_df.groupby("BU_ID")["MONTH"]
                         .nunique()
-                        .reset_index(name="MONTH_COUNT")
-                        )
+                        .reset_index()
+                        .rename(columns={"MONTH": "MONTH_COUNT"})
+                    )
+    
     logger.info(f"Number of rows in month_counts: {len(month_counts)}")
     logger.info(month_counts)
     
