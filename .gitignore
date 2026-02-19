@@ -1,5 +1,6 @@
 *.ckpt
 forecastenv/
+env_map.py
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
