@@ -373,18 +373,24 @@ def clip_outliers_iqr(df, column):
 
 
 
-  
-def upload_forecast_to_snowflake(conn, df):
+def upload_forecast_to_snowflake(conn, df, csp):
     try:
+        with conn.cursor() as cs:
+            cs.execute(
+                "DELETE FROM ANALYTICS.BUDGET_FORECAST WHERE CSP = %s",
+                (csp,)
+            )
+            logger.info(f"Deleted {cs.rowcount} existing rows for CSP='{csp}' from ANALYTICS.BUDGET_FORECAST")
+
         success, nchunks, nrows, _ = write_pandas(
             conn=conn,
             df=df,
             table_name='BUDGET_FORECAST',
             database='DEV1_WEX',
             schema='ANALYTICS',
-            overwrite=True
+            overwrite=False
         )
-        logger.info(f"Uploaded {nrows} rows to DEV1_WEX.ANALYTICS.BUDGET_FORECAST in {nchunks} chunk(s). Success={success}")
+        logger.info(f"Uploaded {nrows} rows to ANALYTICS.BUDGET_FORECAST in {nchunks} chunk(s). Success={success}")
     except Exception as e:
         logger.error(f"Failed to upload forecast to Snowflake: {e}", exc_info=True)
         raise
@@ -533,7 +539,7 @@ def main():
         logger.info(f"combined_forecast_df shaped to BUDGET_FORECAST schema: {combined_forecast_df.shape}")
         logger.info(combined_forecast_df.head())
 
-        upload_forecast_to_snowflake(conn, combined_forecast_df)
+        upload_forecast_to_snowflake(conn, combined_forecast_df, CSP)
 
     except Exception as e:
         logger.error(f"main() failed: {e}", exc_info=True)
