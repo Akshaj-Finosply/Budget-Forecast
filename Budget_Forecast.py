@@ -3,7 +3,6 @@ import numpy as np
 import pandas as pd
 import snowflake.connector
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
-import matplotlib.pyplot as plt
 from snowflake.connector.pandas_tools import write_pandas
 
 from pathlib import Path
@@ -319,47 +318,6 @@ def complete_time_series(temp):
 
     return completed
 
-
-def plot_time_series(df, bu_name, periods=12):
-    plt.figure(figsize=(10, 6))
-
-    # Separate actuals and forecast
-    actual = df[~df['IS_FORECAST']]
-    forecast = df[df['IS_FORECAST']]
-
-    # Plot actuals
-    plt.plot(
-        actual['MONTH'],
-        actual['SPEND'],
-        label='Actual',
-        marker='o'
-    )
-
-    # Plot forecast if it exists
-    if not forecast.empty:
-        plt.plot(
-            forecast['MONTH'],
-            forecast['SPEND'],
-            label=f'Forecast (Next {periods} Months)',
-            marker='x',
-            linestyle='--'
-        )
-
-        max_ylim = max(
-            actual['SPEND'].max() * 1.2,
-            forecast['SPEND'].max() * 1.2,
-            1
-        )
-    else:
-        max_ylim = max(actual['SPEND'].max() * 1.2, 1)
-
-    plt.title(f'{periods}-Month Forecast of Monthly Spent for {bu_name}')
-    plt.xlabel('Month')
-    plt.ylabel('Monthly Spent')
-    plt.ylim(0, max_ylim)
-    plt.legend()
-    plt.grid(True)
-    plt.show()
     
 def clip_outliers_iqr(df, column):
     Q1 = df[column].quantile(0.25)
@@ -457,7 +415,7 @@ def main():
             raise ValueError("Failed to connect to Snowflake")
         logger.info(f"Database: {database}")
         # Config
-        MIN_REQUIRED_MONTHS = 3
+        MIN_REQUIRED_MONTHS = 6
         logger.info(f"MIN_REQUIRED_MONTHS: {MIN_REQUIRED_MONTHS}")
         
         
