@@ -43,13 +43,15 @@ def connect_and_fetch_sf_credentials(customer_name):
         if not config:
             raise ValueError(f"No Snowflake configuration found for customer_id: {customer_name}")
         
-        return snowflake.connector.connect(
+        database = config['DATABASE']
+        conn = snowflake.connector.connect(
             user=config['USER'],
             password=config['PASSWORD'],
             account=config['ACCOUNT'],
             warehouse=config['WAREHOUSE'],
-            database=config['DATABASE'],
+            database=database,
         )
+        return conn, database
     except Exception as e:
         logging.error(f"Snowflake connection error for '{customer_name}': {e}", exc_info=True)
         raise  
@@ -373,24 +375,68 @@ def clip_outliers_iqr(df, column):
 
 
 
-def upload_forecast_to_snowflake(conn, df, csp):
+def forecast_linear_trend(bu_id, temp, periods=12):
+    """
+    Simple linear extrapolation for BUs with fewer than MIN_REQUIRED_MONTHS of data.
+    Uses numpy polyfit (degree 1) over available points; falls back to flat if only 1 point.
+    """
+    temp = temp.copy().sort_values('MONTH').reset_index(drop=True)
+    temp['MONTHLY_SPENT'] = temp['MONTHLY_SPENT'].clip(lower=0)
+
+    x = np.arange(len(temp), dtype=float)
+    y = temp['MONTHLY_SPENT'].values
+
+    if len(temp) >= 2:
+        slope, intercept = np.polyfit(x, y, 1)
+    else:
+        slope, intercept = 0.0, float(y[0]) if len(y) > 0 else 0.0
+
+    last_month = temp['MONTH'].max()
+    forecast_index = pd.date_range(
+        start=last_month + pd.offsets.MonthBegin(1),
+        periods=periods,
+        freq='MS'
+    )
+
+    forecast_values = np.maximum(
+        0,
+        intercept + slope * np.arange(len(temp), len(temp) + periods)
+    )
+
+    actual_df = (
+        temp[['MONTH', 'MONTHLY_SPENT']]
+        .set_axis(['MONTH', 'SPEND'], axis='columns')
+        .assign(IS_FORECAST=False, BU_ID=bu_id)
+    )
+
+    forecast_df = pd.DataFrame({
+        'MONTH': forecast_index,
+        'SPEND': forecast_values,
+        'IS_FORECAST': True,
+        'BU_ID': bu_id
+    })
+
+    return pd.concat([actual_df, forecast_df], ignore_index=True)
+
+
+def upload_forecast_to_snowflake(conn, df, csp, database):
     try:
         with conn.cursor() as cs:
             cs.execute(
-                "DELETE FROM ANALYTICS.BUDGET_FORECAST WHERE CSP = %s",
+                f"DELETE FROM {database}.ANALYTICS.BUDGET_FORECAST WHERE CSP = %s",
                 (csp,)
             )
-            logger.info(f"Deleted {cs.rowcount} existing rows for CSP='{csp}' from ANALYTICS.BUDGET_FORECAST")
+            logger.info(f"Deleted {cs.rowcount} existing rows for CSP='{csp}' from {database}.ANALYTICS.BUDGET_FORECAST")
 
         success, nchunks, nrows, _ = write_pandas(
             conn=conn,
             df=df,
             table_name='BUDGET_FORECAST',
-            database='DEV1_WEX',
+            database=database,
             schema='ANALYTICS',
             overwrite=False
         )
-        logger.info(f"Uploaded {nrows} rows to ANALYTICS.BUDGET_FORECAST in {nchunks} chunk(s). Success={success}")
+        logger.info(f"Uploaded {nrows} rows to {database}.ANALYTICS.BUDGET_FORECAST in {nchunks} chunk(s). Success={success}")
     except Exception as e:
         logger.error(f"Failed to upload forecast to Snowflake: {e}", exc_info=True)
         raise
@@ -406,11 +452,12 @@ def main():
         logger.info(f"Customer: {customer}")
         logger.info(f"CSP: {CSP}")
         logger.info("Connecting to Snowflake")
-        conn = connect_and_fetch_sf_credentials(customer_name=customer)
+        conn, database = connect_and_fetch_sf_credentials(customer_name=customer)
         if not conn:
             raise ValueError("Failed to connect to Snowflake")
+        logger.info(f"Database: {database}")
         # Config
-        MIN_REQUIRED_MONTHS = 4
+        MIN_REQUIRED_MONTHS = 3
         logger.info(f"MIN_REQUIRED_MONTHS: {MIN_REQUIRED_MONTHS}")
         
         
@@ -424,7 +471,6 @@ def main():
 
             
         logger.info(f"Number of rows in bu_cost_df: {len(bu_cost_df)}")
-        logger.info(bu_cost_df)
         month_counts = (
                             bu_cost_df.groupby("BU_ID")["MONTH"]
                             .nunique()
@@ -515,17 +561,33 @@ def main():
             print(f"\n=== Forecast for {bu_name} (BU_ID: {bu_id})  Processed Successfully===")
             forecast = forecast_monthly_spent_long(bu_id=bu_id, temp=temp, periods=forecast_periods)
             final_forecasts.append(forecast)
-        
+
+        # --- SHORT HISTORY: linear trend for BUs below MIN_REQUIRED_MONTHS ---
+        short_bu_list = df_bu.loc[~df_bu['IS_LONG_HISTORY'], 'BU_ID'].to_list()
+        for bu_id in short_bu_list:
+            row = df_bu[df_bu["BU_ID"] == bu_id].iloc[0]
+            bu_name = row["BUSINESS_UNIT_NAME"]
+
+            temp = bu_cost_df[bu_cost_df["BU_ID"] == bu_id].copy()
+            if temp.empty:
+                logger.info(f"No data for BU_ID: {bu_id} ({bu_name}) - skipping linear trend")
+                continue
+
+            temp["MONTH"] = pd.to_datetime(temp["MONTH"])
+            temp = complete_time_series(temp)
+            temp["MONTHLY_SPENT"] = temp["MONTHLY_SPENT"].clip(lower=0)
+
+            print(f"\n=== Linear Trend Forecast for {bu_name} (BU_ID: {bu_id}) ===")
+            forecast = forecast_linear_trend(bu_id=bu_id, temp=temp, periods=forecast_periods)
+            final_forecasts.append(forecast)
+
         if final_forecasts:
             combined_forecast_df = pd.concat(final_forecasts, ignore_index=True)
         else:
             combined_forecast_df = pd.DataFrame()
         logger.info(f"Number of rows in combined_forecast_df: {len(combined_forecast_df)}")
-        logger.info(combined_forecast_df)
         
         combined_forecast_df['CSP'] = CSP
-
-        # Reshape to match DEV1_WEX.ANALYTICS.BUDGET_FORECAST schema
         combined_forecast_df = (
             combined_forecast_df
             .assign(
@@ -539,7 +601,7 @@ def main():
         logger.info(f"combined_forecast_df shaped to BUDGET_FORECAST schema: {combined_forecast_df.shape}")
         logger.info(combined_forecast_df.head())
 
-        upload_forecast_to_snowflake(conn, combined_forecast_df, CSP)
+        upload_forecast_to_snowflake(conn, combined_forecast_df, CSP, database)
 
     except Exception as e:
         logger.error(f"main() failed: {e}", exc_info=True)
