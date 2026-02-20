@@ -4,7 +4,7 @@ import pandas as pd
 import snowflake.connector
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 import matplotlib.pyplot as plt
-
+from snowflake.connector.pandas_tools import write_pandas
 
 from pathlib import Path
 import sys 
@@ -374,135 +374,174 @@ def clip_outliers_iqr(df, column):
 
 
   
+def upload_forecast_to_snowflake(conn, df):
+    try:
+        success, nchunks, nrows, _ = write_pandas(
+            conn=conn,
+            df=df,
+            table_name='BUDGET_FORECAST',
+            database='DEV1_WEX',
+            schema='ANALYTICS',
+            overwrite=True
+        )
+        logger.info(f"Uploaded {nrows} rows to DEV1_WEX.ANALYTICS.BUDGET_FORECAST in {nchunks} chunk(s). Success={success}")
+    except Exception as e:
+        logger.error(f"Failed to upload forecast to Snowflake: {e}", exc_info=True)
+        raise
+
+
 def main():
-    customer = 'dev1-wex'
-    customer = customer.lower()
-    CSP = 'aws'
-    CSP = CSP.upper()
-    logger.info(f"Customer: {customer}")
-    logger.info(f"CSP: {CSP}")
-    logger.info("Connecting to Snowflake")
-    conn = connect_and_fetch_sf_credentials(customer_name=customer)
-    if not conn:
-        raise ValueError("Failed to connect to Snowflake")
-    # Config
-    MIN_REQUIRED_MONTHS = 4
-    logger.info(f"MIN_REQUIRED_MONTHS: {MIN_REQUIRED_MONTHS}")
-    
-    
-    current_month = datetime.now().strftime("%Y%m")
-    logger.info(f"Current month: {current_month}")
-    
-    bu_cost_df = fetch_merged_costs(conn, CSP, current_month)
-    if bu_cost_df.empty:
-        logger.error("No data returned from Snowflake query")
-        raise ValueError("No data returned from Snowflake query")
-
-    
+    conn = None
+    try:
+        customer = 'dev1-wex'
+        customer = customer.lower()
+        CSP = 'aws'
+        CSP = CSP.upper()
+        logger.info(f"Customer: {customer}")
+        logger.info(f"CSP: {CSP}")
+        logger.info("Connecting to Snowflake")
+        conn = connect_and_fetch_sf_credentials(customer_name=customer)
+        if not conn:
+            raise ValueError("Failed to connect to Snowflake")
+        # Config
+        MIN_REQUIRED_MONTHS = 4
+        logger.info(f"MIN_REQUIRED_MONTHS: {MIN_REQUIRED_MONTHS}")
         
-    logger.info(f"Number of rows in bu_cost_df: {len(bu_cost_df)}")
-    logger.info(bu_cost_df)
-    month_counts = (
-                        bu_cost_df.groupby("BU_ID")["MONTH"]
-                        .nunique()
-                        .reset_index()
-                        .rename(columns={"MONTH": "MONTH_COUNT"})
-                    )
-    
-    logger.info(f"Number of rows in month_counts: {len(month_counts)}")
-    logger.info(month_counts)
-    
-    month_counts["IS_LONG_HISTORY"] = month_counts["MONTH_COUNT"] >= MIN_REQUIRED_MONTHS
-    
-    df_bu = fetch_bu_names(conn)
-    if df_bu is False:
-        raise ValueError("Failed to fetch bu names")
-    
-    df_bu =  df_bu.merge(
-                month_counts[["BU_ID", "IS_LONG_HISTORY"]],
-                on="BU_ID",
-                how="left"
-            )
-    df_bu["IS_LONG_HISTORY"] = df_bu["IS_LONG_HISTORY"].where(df_bu["IS_LONG_HISTORY"].notna(), False).astype(bool)
-    df_bu = df_bu.sort_values(["BU_ID"]).reset_index(drop=True)
-    logger.info(f"Number of rows in df_bu: {len(df_bu)}")
-    logger.info(df_bu)
-
-    # Forecasting 
-    bu_list = df_bu.loc[df_bu['IS_LONG_HISTORY'], 'BU_ID'].to_list()
-    forecast_periods = 12
-    final_forecasts = []
-    
-    for bu_id in bu_list:
-        row = df_bu[df_bu["BU_ID"] == bu_id].iloc[0]
-        bu_name = row["BUSINESS_UNIT_NAME"]
-
-        # Extract BU dataset
-        temp = bu_cost_df[bu_cost_df["BU_ID"] == bu_id].copy()
         
-        temp["MONTH"] = pd.to_datetime(temp["MONTH"])
-        # Clean Data and complete Time Series
-        temp = complete_time_series(temp)
-        # --- SAFETY CHECKS ---
+        current_month = datetime.now().strftime("%Y%m")
+        logger.info(f"Current month: {current_month}")
         
-        #No Negative Values
-        temp["MONTHLY_SPENT"] = temp["MONTHLY_SPENT"].clip(lower=0)
-        # 1. Check if it is empty
-        if temp.empty:
-            print(f"No data available for BU_ID: {bu_id}")
-            continue
+        bu_cost_df = fetch_merged_costs(conn, CSP, current_month)
+        if bu_cost_df.empty:
+            logger.error("No data returned from Snowflake query")
+            raise ValueError("No data returned from Snowflake query")
+
+            
+        logger.info(f"Number of rows in bu_cost_df: {len(bu_cost_df)}")
+        logger.info(bu_cost_df)
+        month_counts = (
+                            bu_cost_df.groupby("BU_ID")["MONTH"]
+                            .nunique()
+                            .reset_index()
+                            .rename(columns={"MONTH": "MONTH_COUNT"})
+                        )
         
-        # 2. Check if the max value is Zero then give all future values zero  
-        if temp["MONTHLY_SPENT"].max() == 0:
-            print(f"\n=== Forecast for {bu_name} (BU_ID: {bu_id}) ===")
-            print("All historical values are zero → Forecasting zeros.")
-
-            last_month = temp['MONTH'].max()
-
-            forecast_index = pd.date_range(
-                start=last_month + pd.offsets.MonthBegin(1),
-                periods=forecast_periods,
-                freq='MS'
-            )
-
-            actual_df = (
-                temp[['MONTH', 'MONTHLY_SPENT']]
-                .set_axis(['MONTH', 'SPEND'], axis='columns')
-                .assign(
-                    IS_FORECAST=False,
-                    BU_ID=bu_id
+        logger.info(f"Number of rows in month_counts: {len(month_counts)}")
+        logger.info(month_counts)
+        
+        month_counts["IS_LONG_HISTORY"] = month_counts["MONTH_COUNT"] >= MIN_REQUIRED_MONTHS
+        
+        df_bu = fetch_bu_names(conn)
+        if df_bu is False:
+            raise ValueError("Failed to fetch bu names")
+        
+        df_bu =  df_bu.merge(
+                    month_counts[["BU_ID", "IS_LONG_HISTORY"]],
+                    on="BU_ID",
+                    how="left"
                 )
+        df_bu["IS_LONG_HISTORY"] = df_bu["IS_LONG_HISTORY"].where(df_bu["IS_LONG_HISTORY"].notna(), False).astype(bool)
+        df_bu = df_bu.sort_values(["BU_ID"]).reset_index(drop=True)
+        logger.info(f"Number of rows in df_bu: {len(df_bu)}")
+        logger.info(df_bu)
+
+        # Forecasting 
+        bu_list = df_bu.loc[df_bu['IS_LONG_HISTORY'], 'BU_ID'].to_list()
+        forecast_periods = 12
+        final_forecasts = []
+        
+        for bu_id in bu_list:
+            row = df_bu[df_bu["BU_ID"] == bu_id].iloc[0]
+            bu_name = row["BUSINESS_UNIT_NAME"]
+
+            # Extract BU dataset
+            temp = bu_cost_df[bu_cost_df["BU_ID"] == bu_id].copy()
+            
+            temp["MONTH"] = pd.to_datetime(temp["MONTH"])
+            # Clean Data and complete Time Series
+            temp = complete_time_series(temp)
+            # --- SAFETY CHECKS ---
+            
+            #No Negative Values
+            temp["MONTHLY_SPENT"] = temp["MONTHLY_SPENT"].clip(lower=0)
+            # 1. Check if it is empty
+            if temp.empty:
+                print(f"No data available for BU_ID: {bu_id}")
+                continue
+            
+            # 2. Check if the max value is Zero then give all future values zero  
+            if temp["MONTHLY_SPENT"].max() == 0:
+                print(f"\n=== Forecast for {bu_name} (BU_ID: {bu_id}) ===")
+                print("All historical values are zero → Forecasting zeros.")
+
+                last_month = temp['MONTH'].max()
+
+                forecast_index = pd.date_range(
+                    start=last_month + pd.offsets.MonthBegin(1),
+                    periods=forecast_periods,
+                    freq='MS'
+                )
+
+                actual_df = (
+                    temp[['MONTH', 'MONTHLY_SPENT']]
+                    .set_axis(['MONTH', 'SPEND'], axis='columns')
+                    .assign(
+                        IS_FORECAST=False,
+                        BU_ID=bu_id
+                    )
+                )
+
+                forecast_df = pd.DataFrame({
+                    "MONTH": forecast_index,
+                    "SPEND": 0,
+                    "IS_FORECAST": True,
+                    "BU_ID": bu_id
+                })
+
+                combined_df = pd.concat([actual_df, forecast_df], ignore_index=True)
+
+                final_forecasts.append(combined_df)
+                continue
+            # Clipping Outliers 
+            temp= clip_outliers_iqr(temp, "MONTHLY_SPENT")
+
+            # --- NORMAL FORECASTING ---
+            print(f"\n=== Forecast for {bu_name} (BU_ID: {bu_id})  Processed Successfully===")
+            forecast = forecast_monthly_spent_long(bu_id=bu_id, temp=temp, periods=forecast_periods)
+            final_forecasts.append(forecast)
+        
+        if final_forecasts:
+            combined_forecast_df = pd.concat(final_forecasts, ignore_index=True)
+        else:
+            combined_forecast_df = pd.DataFrame()
+        logger.info(f"Number of rows in combined_forecast_df: {len(combined_forecast_df)}")
+        logger.info(combined_forecast_df)
+        
+        combined_forecast_df['CSP'] = CSP
+
+        # Reshape to match DEV1_WEX.ANALYTICS.BUDGET_FORECAST schema
+        combined_forecast_df = (
+            combined_forecast_df
+            .assign(
+                FO_BUSINESS_UNIT_ID=lambda df: df['BU_ID'].astype(int),
+                YEAR_MONTH=lambda df: df['MONTH'].dt.strftime('%Y%m'),
+                SPEND=lambda df: df['SPEND'].round(2),
+                FORECAST_FLAG=lambda df: df['IS_FORECAST'].astype(int),
             )
+            [['CSP', 'FO_BUSINESS_UNIT_ID', 'YEAR_MONTH', 'SPEND', 'FORECAST_FLAG']]
+        )
+        logger.info(f"combined_forecast_df shaped to BUDGET_FORECAST schema: {combined_forecast_df.shape}")
+        logger.info(combined_forecast_df.head())
 
-            forecast_df = pd.DataFrame({
-                "MONTH": forecast_index,
-                "SPEND": 0,
-                "IS_FORECAST": True,
-                "BU_ID": bu_id
-            })
+        upload_forecast_to_snowflake(conn, combined_forecast_df)
 
-            combined_df = pd.concat([actual_df, forecast_df], ignore_index=True)
-
-            final_forecasts.append(combined_df)
-            continue
-        # Clipping Outliers 
-        temp= clip_outliers_iqr(temp, "MONTHLY_SPENT")
-
-        # --- NORMAL FORECASTING ---
-        print(f"\n=== Forecast for {bu_name} (BU_ID: {bu_id}) ===")
-        forecast = forecast_monthly_spent_long(bu_id=bu_id, temp=temp, periods=forecast_periods)
-        final_forecasts.append(forecast)
-    
-    if final_forecasts:
-        combined_forecast_df = pd.concat(final_forecasts, ignore_index=True)
-    else:
-        combined_forecast_df = pd.DataFrame()
-    logger.info(f"Number of rows in combined_forecast_df: {len(combined_forecast_df)}")
-    logger.info(combined_forecast_df)
-    
-    combined_forecast_df['CSP'] = CSP
-    
-    combined_forecast_df.to_csv(f"combined_forecast_df_{customer}_{CSP}_{current_month}.csv", index=False)
+    except Exception as e:
+        logger.error(f"main() failed: {e}", exc_info=True)
+        raise
+    finally:
+        if conn:
+            conn.close()
+            logger.info("Snowflake connection closed.")
 
 
 if __name__ == "__main__":
