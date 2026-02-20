@@ -194,6 +194,7 @@ def fetch_bu_names(conn=None):
         raise ValueError(f"An error occurred: {str(e)}")
     
 
+
 def fit_and_forecast(df, forecast_period=12, is_log=False):
     """
     Fits a Holt-Winters model and returns a forecast Series.
@@ -232,6 +233,144 @@ def fit_and_forecast(df, forecast_period=12, is_log=False):
         forecast = np.expm1(forecast)
 
     return forecast
+
+
+
+def forecast_monthly_spent_long(bu_id, temp, periods=12):
+    temp = temp.copy()
+    temp.set_index('MONTH', inplace=True)
+    temp.index = pd.to_datetime(temp.index)
+    temp = temp.asfreq('MS')
+
+    forecast = fit_and_forecast(temp, forecast_period=periods)
+
+    recent_mean = (
+        temp['MONTHLY_SPENT'].tail(3).mean()
+        if len(temp) >= 3
+        else temp['MONTHLY_SPENT'].mean()
+    )
+
+    # Refit if forecast collapses too much
+    if forecast.mean() < 0.6 * recent_mean or forecast.min() < 0.4 * recent_mean:
+
+        temp['LOG_SPENT'] = np.log1p(temp['MONTHLY_SPENT'])
+        forecast = fit_and_forecast(temp, forecast_period=periods, is_log=True)
+
+        trend_slope = temp['MONTHLY_SPENT'].diff().mean()
+
+        # Floor logic
+        if trend_slope < 0 and temp['MONTHLY_SPENT'].iloc[-1] < (recent_mean * 0.5):
+            floor = 0
+        else:
+            floor = max(
+                temp['MONTHLY_SPENT'].iloc[-1] * 0.05,
+                recent_mean * 0.02,
+                0
+            )
+
+        forecast = forecast.clip(lower=floor)
+        
+    actual_df = (
+        temp[['MONTHLY_SPENT']]
+        .rename(columns={'MONTHLY_SPENT': 'SPEND'})
+        .assign(IS_FORECAST=False)
+    )
+
+    forecast_df = (
+        forecast.to_frame(name='SPEND')
+        .assign(IS_FORECAST=True)
+    )
+
+    combined_df = pd.concat([actual_df, forecast_df], axis=0)
+
+    combined_df['BU_ID'] = bu_id
+    combined_df = combined_df.reset_index().rename(columns={'index': 'MONTH'})
+
+    return combined_df
+
+def complete_time_series(temp):
+    """
+    Ensures continuous monthly data for a single BU.
+    Missing months are added with MONTHLY_SPENT = 0.
+    """
+    # Full monthly index for this BU
+    full_idx = pd.date_range(
+        start=temp["MONTH"].min(),
+        end=temp["MONTH"].max(),
+        freq="MS"
+    )
+
+    # Reindex on MONTH
+    completed = (
+        temp.set_index("MONTH")
+            .reindex(full_idx)
+            .rename_axis("MONTH")
+            .reset_index()
+    )
+
+    # Fill BU ID and BU name
+    completed["BU_ID"] = temp["BU_ID"].iloc[0]
+    completed["BUSINESS_UNIT_NAME"] = temp["BUSINESS_UNIT_NAME"].iloc[0]
+
+    # Fill missing spent with 0
+    completed["MONTHLY_SPENT"] = completed["MONTHLY_SPENT"].fillna(0)
+
+    return completed
+
+
+def plot_time_series(df, bu_name, periods=12):
+    plt.figure(figsize=(10, 6))
+
+    # Separate actuals and forecast
+    actual = df[~df['IS_FORECAST']]
+    forecast = df[df['IS_FORECAST']]
+
+    # Plot actuals
+    plt.plot(
+        actual['MONTH'],
+        actual['SPEND'],
+        label='Actual',
+        marker='o'
+    )
+
+    # Plot forecast if it exists
+    if not forecast.empty:
+        plt.plot(
+            forecast['MONTH'],
+            forecast['SPEND'],
+            label=f'Forecast (Next {periods} Months)',
+            marker='x',
+            linestyle='--'
+        )
+
+        max_ylim = max(
+            actual['SPEND'].max() * 1.2,
+            forecast['SPEND'].max() * 1.2,
+            1
+        )
+    else:
+        max_ylim = max(actual['SPEND'].max() * 1.2, 1)
+
+    plt.title(f'{periods}-Month Forecast of Monthly Spent for {bu_name}')
+    plt.xlabel('Month')
+    plt.ylabel('Monthly Spent')
+    plt.ylim(0, max_ylim)
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+    
+def clip_outliers_iqr(df, column):
+    Q1 = df[column].quantile(0.25)
+    Q3 = df[column].quantile(0.75)
+    IQR = Q3 - Q1
+
+    lower_bound = Q1 - 1.5 * IQR
+    upper_bound = Q3 + 1.5 * IQR
+
+    df = df.copy()
+    df[column] = df[column].clip(lower=lower_bound, upper=upper_bound)
+    return df
+
 
 
   
@@ -288,6 +427,82 @@ def main():
     df_bu = df_bu.sort_values(["BU_ID"]).reset_index(drop=True)
     logger.info(f"Number of rows in df_bu: {len(df_bu)}")
     logger.info(df_bu)
+
+    # Forecasting 
+    bu_list = df_bu.loc[df_bu['IS_LONG_HISTORY'], 'BU_ID'].to_list()
+    forecast_periods = 12
+    final_forecasts = []
+    
+    for bu_id in bu_list:
+        row = df_bu[df_bu["BU_ID"] == bu_id].iloc[0]
+        bu_name = row["BUSINESS_UNIT_NAME"]
+
+        # Extract BU dataset
+        temp = bu_cost_df[bu_cost_df["BU_ID"] == bu_id].copy()
+        
+        temp["MONTH"] = pd.to_datetime(temp["MONTH"])
+        # Clean Data and complete Time Series
+        temp = complete_time_series(temp)
+        # --- SAFETY CHECKS ---
+        
+        #No Negative Values
+        temp["MONTHLY_SPENT"] = temp["MONTHLY_SPENT"].clip(lower=0)
+        # 1. Check if it is empty
+        if temp.empty:
+            print(f"No data available for BU_ID: {bu_id}")
+            continue
+        
+        # 2. Check if the max value is Zero then give all future values zero  
+        if temp["MONTHLY_SPENT"].max() == 0:
+            print(f"\n=== Forecast for {bu_name} (BU_ID: {bu_id}) ===")
+            print("All historical values are zero → Forecasting zeros.")
+
+            last_month = temp['MONTH'].max()
+
+            forecast_index = pd.date_range(
+                start=last_month + pd.offsets.MonthBegin(1),
+                periods=forecast_periods,
+                freq='MS'
+            )
+
+            actual_df = (
+                temp[['MONTH', 'MONTHLY_SPENT']]
+                .set_axis(['MONTH', 'SPEND'], axis='columns')
+                .assign(
+                    IS_FORECAST=False,
+                    BU_ID=bu_id
+                )
+            )
+
+            forecast_df = pd.DataFrame({
+                "MONTH": forecast_index,
+                "SPEND": 0,
+                "IS_FORECAST": True,
+                "BU_ID": bu_id
+            })
+
+            combined_df = pd.concat([actual_df, forecast_df], ignore_index=True)
+
+            final_forecasts.append(combined_df)
+            continue
+        # Clipping Outliers 
+        temp= clip_outliers_iqr(temp, "MONTHLY_SPENT")
+
+        # --- NORMAL FORECASTING ---
+        print(f"\n=== Forecast for {bu_name} (BU_ID: {bu_id}) ===")
+        forecast = forecast_monthly_spent_long(bu_id=bu_id, temp=temp, periods=forecast_periods)
+        final_forecasts.append(forecast)
+    
+    if final_forecasts:
+        combined_forecast_df = pd.concat(final_forecasts, ignore_index=True)
+    else:
+        combined_forecast_df = pd.DataFrame()
+    logger.info(f"Number of rows in combined_forecast_df: {len(combined_forecast_df)}")
+    logger.info(combined_forecast_df)
+    
+    combined_forecast_df['CSP'] = CSP
+    
+    combined_forecast_df.to_csv(f"combined_forecast_df_{customer}_{CSP}_{current_month}.csv", index=False)
 
 
 if __name__ == "__main__":
