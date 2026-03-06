@@ -10,8 +10,7 @@ import sys
 
 bar = "="*100
 
-project_root = Path().resolve()
-print(project_root)
+project_root = Path(__file__).resolve().parent
 sys.path.append(str(project_root))
 
 from env_map import customer_env_map
@@ -132,7 +131,7 @@ def fetch_merged_costs(conn=None, CSP=None, current_month=None):
 
             # Execute query with parameters
             logger.info(f"Executing query with CSP={CSP.upper()} and current_month={current_month}")
-            logger.info(f"Executing query: {query}")
+            logger.debug(f"Executing query: {query}")
             cs.execute( query, (CSP.upper(), current_month, CSP.upper(), current_month))
 
             # Fetch data into a pandas DataFrame
@@ -252,8 +251,8 @@ def forecast_monthly_spent_long(bu_id, temp, periods=12):
         else temp['MONTHLY_SPENT'].mean()
     )
 
-    # Refit if forecast collapses too much
-    if forecast.mean() < 0.6 * recent_mean or forecast.min() < 0.4 * recent_mean:
+    # Refit if forecast collapses too much (only meaningful when recent spend is non-zero)
+    if recent_mean > 0 and (forecast.mean() < 0.6 * recent_mean or forecast.min() < 0.4 * recent_mean):
 
         temp['LOG_SPENT'] = np.log1p(temp['MONTHLY_SPENT'])
         forecast = fit_and_forecast(temp, forecast_period=periods, is_log=True)
@@ -380,6 +379,7 @@ def forecast_linear_trend(bu_id, temp, periods=12):
 
 def upload_forecast_to_snowflake(conn, df, csp, database):
     try:
+        conn.autocommit(False)
         with conn.cursor() as cs:
             cs.execute(
                 f"DELETE FROM {database}.ANALYTICS.BUDGET_FORECAST WHERE CSP = %s",
@@ -395,10 +395,14 @@ def upload_forecast_to_snowflake(conn, df, csp, database):
             schema='ANALYTICS',
             overwrite=False
         )
+        conn.commit()
         logger.info(f"Uploaded {nrows} rows to {database}.ANALYTICS.BUDGET_FORECAST in {nchunks} chunk(s). Success={success}")
     except Exception as e:
+        conn.rollback()
         logger.error(f"Failed to upload forecast to Snowflake: {e}", exc_info=True)
         raise
+    finally:
+        conn.autocommit(True)
 
 
 def main(customer = "", CSP = ""):
@@ -410,7 +414,7 @@ def main(customer = "", CSP = ""):
         logger.info(f"CSP: {CSP}")
         logger.info("Connecting to Snowflake")
         conn, database = connect_and_fetch_sf_credentials(customer_name=customer)
-        if not conn:
+        if conn is None:
             raise ValueError("Failed to connect to Snowflake")
         logger.info(f"Database: {database}")
         # Config
@@ -449,7 +453,7 @@ def main(customer = "", CSP = ""):
                     on="BU_ID",
                     how="left"
                 )
-        df_bu["IS_LONG_HISTORY"] = df_bu["IS_LONG_HISTORY"].where(df_bu["IS_LONG_HISTORY"].notna(), False).astype(bool)
+        df_bu["IS_LONG_HISTORY"] = df_bu["IS_LONG_HISTORY"].fillna(False).astype(bool)
         df_bu = df_bu.sort_values(["BU_ID"]).reset_index(drop=True)
         logger.info(f"Number of rows in df_bu: {len(df_bu)}")
         logger.info(df_bu)
@@ -475,13 +479,13 @@ def main(customer = "", CSP = ""):
             temp["MONTHLY_SPENT"] = temp["MONTHLY_SPENT"].clip(lower=0)
             # 1. Check if it is empty
             if temp.empty:
-                print(f"No data available for BU_ID: {bu_id}")
+                logger.info(f"No data available for BU_ID: {bu_id}")
                 continue
             
             # 2. Check if the max value is Zero then give all future values zero  
             if temp["MONTHLY_SPENT"].max() == 0:
-                print(f"\n=== Forecast for {bu_name} (BU_ID: {bu_id}) ===")
-                print("All historical values are zero → Forecasting zeros.")
+                logger.info(f"=== Forecast for {bu_name} (BU_ID: {bu_id}) ===")
+                logger.info("All historical values are zero - Forecasting zeros.")
 
                 last_month = temp['MONTH'].max()
 
@@ -515,7 +519,7 @@ def main(customer = "", CSP = ""):
             temp= clip_outliers_iqr(temp, "MONTHLY_SPENT")
 
             # --- NORMAL FORECASTING ---
-            print(f"\n=== Forecast for {bu_name} (BU_ID: {bu_id})  Processed Successfully===")
+            logger.info(f"=== Forecast for {bu_name} (BU_ID: {bu_id}) Processed Successfully ===")
             forecast = forecast_monthly_spent_long(bu_id=bu_id, temp=temp, periods=forecast_periods)
             final_forecasts.append(forecast)
 
@@ -534,7 +538,7 @@ def main(customer = "", CSP = ""):
             temp = complete_time_series(temp)
             temp["MONTHLY_SPENT"] = temp["MONTHLY_SPENT"].clip(lower=0)
 
-            print(f"\n=== Linear Trend Forecast for {bu_name} (BU_ID: {bu_id}) ===")
+            logger.info(f"=== Linear Trend Forecast for {bu_name} (BU_ID: {bu_id}) ===")
             forecast = forecast_linear_trend(bu_id=bu_id, temp=temp, periods=forecast_periods)
             final_forecasts.append(forecast)
 
@@ -570,6 +574,9 @@ def main(customer = "", CSP = ""):
 
 
 if __name__ == "__main__":
-    customer = 'dev1-wex'
-    CSP = 'aws'
-    main(customer, CSP)
+    import argparse
+    parser = argparse.ArgumentParser(description="Run Budget Forecast for a given customer and CSP.")
+    parser.add_argument("--customer", type=str, default="dev1-wex", help="Customer name (e.g. dev1-wex)")
+    parser.add_argument("--csp", type=str, default="aws", help="Cloud service provider (e.g. aws, azure, gcp)")
+    args = parser.parse_args()
+    main(args.customer, args.csp)
