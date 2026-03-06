@@ -31,11 +31,13 @@ logging.basicConfig(
     ]
 )
 
-logger = logging.getLogger(__name__)  # Create a logger instance for this module
+logger = logging.getLogger(__name__) 
 
 logger.info(bar)
 logger.info(bar)
 logger.info("Beginning Logging")
+
+#Fetching Snowflake credentials
 def connect_and_fetch_sf_credentials(customer_name):
     try:
         config = customer_env_map.get(customer_name)
@@ -57,6 +59,7 @@ def connect_and_fetch_sf_credentials(customer_name):
     
 
 
+# Fetch Merged Costs based on CSP and current month
 def fetch_merged_costs(conn=None, CSP=None, current_month=None):
     # Check if the connection, CSP, or current_month is not provided
     if not conn or not CSP or not current_month:
@@ -68,7 +71,7 @@ def fetch_merged_costs(conn=None, CSP=None, current_month=None):
         logger.info("Starting the query execution.")
         with conn.cursor() as cs:
             # Query with parameterized inputs to avoid SQL injection risks
-            query = f"""
+            query = """
                     WITH CHILD_BUS AS (
                         SELECT DISTINCT
                             ROOT_BU_ID,
@@ -102,9 +105,8 @@ def fetch_merged_costs(conn=None, CSP=None, current_month=None):
                         ON A.BUSINESS_UNIT_ID = CBU.BU_ID
                     INNER JOIN BU_CTE BU
                         ON CBU.ROOT_BU_ID = BU.FO_BUSINESS_UNIT_ID
-                    WHERE 
-                        UPPER(A.CSP) = '{CSP}'
-                        AND A.MONTH <> {current_month}
+                    WHERE UPPER(A.CSP) = %s
+                            AND A.MONTH <> %s
                     GROUP BY 
                         CBU.ROOT_BU_ID,
                         BU.BUSINESS_UNIT_NAME,
@@ -120,9 +122,8 @@ def fetch_merged_costs(conn=None, CSP=None, current_month=None):
                         SUM(A.COST) AS MONTHLY_SPENT
                     FROM APP.CHARGEBACK AS A
                     INNER JOIN ALL_BU AB ON 1 = 1
-                    WHERE 
-                        UPPER(A.CSP) = '{CSP}'
-                        AND A.MONTH <> {current_month}
+                    WHERE UPPER(A.CSP) = %s
+                        AND A.MONTH <> %s
                     GROUP BY A.MONTH,
                              AB.FO_BUSINESS_UNIT_ID,
                              AB.BUSINESS_UNIT_NAME
@@ -132,7 +133,7 @@ def fetch_merged_costs(conn=None, CSP=None, current_month=None):
             # Execute query with parameters
             logger.info(f"Executing query with CSP={CSP.upper()} and current_month={current_month}")
             logger.info(f"Executing query: {query}")
-            cs.execute(query)
+            cs.execute( query, (CSP.upper(), current_month, CSP.upper(), current_month))
 
             # Fetch data into a pandas DataFrame
             logger.info("Fetching results into a pandas DataFrame.")
@@ -400,12 +401,10 @@ def upload_forecast_to_snowflake(conn, df, csp, database):
         raise
 
 
-def main():
+def main(customer = "", CSP = ""):
     conn = None
     try:
-        customer = 'dev1-wex'
         customer = customer.lower()
-        CSP = 'aws'
         CSP = CSP.upper()
         logger.info(f"Customer: {customer}")
         logger.info(f"CSP: {CSP}")
@@ -442,7 +441,7 @@ def main():
         month_counts["IS_LONG_HISTORY"] = month_counts["MONTH_COUNT"] >= MIN_REQUIRED_MONTHS
         
         df_bu = fetch_bu_names(conn)
-        if df_bu is False:
+        if df_bu.empty:
             raise ValueError("Failed to fetch bu names")
         
         df_bu =  df_bu.merge(
@@ -552,7 +551,7 @@ def main():
                 FO_BUSINESS_UNIT_ID=lambda df: df['BU_ID'].astype(int),
                 YEAR_MONTH=lambda df: df['MONTH'].dt.strftime('%Y%m'),
                 SPEND=lambda df: df['SPEND'].round(2),
-                FORECAST_FLAG=lambda df: df['IS_FORECAST'].astype(int),
+                FORECAST_FLAG=lambda df: df['IS_FORECAST'].astype(bool),
             )
             [['CSP', 'FO_BUSINESS_UNIT_ID', 'YEAR_MONTH', 'SPEND', 'FORECAST_FLAG']]
         )
@@ -571,4 +570,6 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    customer = 'dev1-wex'
+    CSP = 'aws'
+    main(customer, CSP)
