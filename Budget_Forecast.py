@@ -13,7 +13,7 @@ bar = "="*100
 project_root = Path(__file__).resolve().parent
 sys.path.append(str(project_root))
 
-from env_map import customer_env_map
+from env_map import customer_env_map, app_customer_env_map
 
 pd.options.display.float_format = '{:,.2f}'.format
 
@@ -36,10 +36,11 @@ logger.info(bar)
 logger.info(bar)
 logger.info("Beginning Logging")
 
+env_map = app_customer_env_map
 #Fetching Snowflake credentials
 def connect_and_fetch_sf_credentials(customer_name):
     try:
-        config = customer_env_map.get(customer_name)
+        config = env_map.get(customer_name)
         if not config:
             raise ValueError(f"No Snowflake configuration found for customer_id: {customer_name}")
         
